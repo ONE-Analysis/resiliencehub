@@ -190,9 +190,9 @@ def full_preprocessing_pipeline():
     Run the full preprocessing pipeline:
       - Load datasets specified in config.data_files
       - Process facilities and places of worship (POFW)
-      - Merge point datasets
-      - Join with lots data, then merge with buildings and NSI data
-      - Export final preprocessed sites
+      - Merge point datasets to create an intermediate 'sites.geojson' in the input folder
+      - Then proceed with joining with lots, merging with buildings and NSI data,
+        and export the final preprocessed sites as a GeoJSON file (shapefile export is omitted)
     """
     start_time = time.time()  # Initialize start_time here!
     
@@ -218,21 +218,35 @@ def full_preprocessing_pipeline():
     if 'pofw' in datasets and datasets['pofw'] is not None:
         datasets['pofw'] = process_pofw(datasets['pofw'])
     
-    bldg_pts = merge_point_datasets(datasets)
+    # -------------------------------
+    # Merge point datasets into a single "sites" dataset.
+    # -------------------------------
+    sites_geojson = INPUT_FOLDER / "sites.geojson"
+    if not sites_geojson.exists():
+        print("\nMerging point datasets into 'sites.geojson'...")
+        sites = merge_point_datasets(datasets)
+        sites.to_file(sites_geojson, driver="GeoJSON")
+        print(f"'sites.geojson' created in {INPUT_FOLDER}")
+    else:
+        print(f"\nUsing precomputed 'sites.geojson' from {INPUT_FOLDER}")
+        sites = gpd.read_file(sites_geojson)
     
+    # -------------------------------
+    # Continue with the remaining preprocessing steps.
+    # -------------------------------
     print("\nExtracting data from lots...")
-    if 'lots' in datasets and datasets['lots'] is not None and len(bldg_pts) > 0:
-        bldg_pts = gpd.sjoin(bldg_pts, datasets['lots'][LOT_FIELDS + ['geometry']], how='left', predicate='within')
-        if 'index_right' in bldg_pts.columns:
-            bldg_pts.drop(columns=['index_right'], inplace=True)
-        matched = bldg_pts[~bldg_pts['Address'].isna()].shape[0]
-        unmatched = bldg_pts[bldg_pts['Address'].isna()].shape[0]
+    if 'lots' in datasets and datasets['lots'] is not None and len(sites) > 0:
+        sites = gpd.sjoin(sites, datasets['lots'][LOT_FIELDS + ['geometry']], how='left', predicate='within')
+        if 'index_right' in sites.columns:
+            sites.drop(columns=['index_right'], inplace=True)
+        matched = sites[~sites['Address'].isna()].shape[0]
+        unmatched = sites[sites['Address'].isna()].shape[0]
         print(f"Lot data matched: {matched}; unmatched: {unmatched}")
     
     print("\nMerging point data with buildings...")
-    if 'buildings' in datasets and datasets['buildings'] is not None and len(bldg_pts) > 0:
+    if 'buildings' in datasets and datasets['buildings'] is not None and len(sites) > 0:
         buildings = datasets['buildings'][['geometry', 'groundelev', 'heightroof', 'lststatype', 'cnstrct_yr']]
-        joined = gpd.sjoin(buildings, bldg_pts, how='inner', predicate='contains')
+        joined = gpd.sjoin(buildings, sites, how='inner', predicate='contains')
         print("Joined columns:", joined.columns)
         def combine_values(series):
             vals = series.dropna().unique()
@@ -266,11 +280,8 @@ def full_preprocessing_pipeline():
             buildings[f] = grouped_nsi[f]
         datasets['buildings'] = buildings
     
-    output_dir = Path(config.output_dir) / "sitesofinterest"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    shp_output = output_dir / "preprocessed_sites_RH.shp"
+    # Export final preprocessed sites as a GeoJSON (omitting shapefile export).
     geojson_output = Path(config.output_dir) / "preprocessed_sites_RH.geojson"
-    datasets['buildings'].to_file(shp_output, driver="ESRI Shapefile")
     datasets['buildings'].to_file(geojson_output, driver="GeoJSON")
     print(f"\nPreprocessing complete. Final sites saved to {geojson_output}")
     

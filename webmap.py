@@ -2,65 +2,75 @@
 webmap.py
 
 This module builds an interactive HTML webmap for the Resilience Hub Prioritization Analysis.
-It reads an exported GeoJSON file (with computed indices) and creates a folium map with popups
-that display analysis metrics based on the configuration in config.py.
+It reads an exported GeoJSON file (with computed indices) and creates a folium map with a true tooltip
+that displays the non-zero index values for each analysis factor.
 """
 
 import os
 import folium
 import geopandas as gpd
 
-def create_popup_content(properties, dataset_info):
+def create_tooltip_content(properties, dataset_info, weight_scenario):
     """
-    Build an HTML snippet that displays:
-      - A header with the site identifier,
+    Build an HTML snippet for a true tooltip that displays:
+      - The site identifier,
       - The overall Suitability Index,
-      - For each analysis factor: the raw value (with any prefix/suffix) and the normalized index.
+      - For each analysis factor whose corresponding weight is nonzero,
+        display its raw value (with any prefix/suffix) and the normalized index.
     
-    Uses the mapping in dataset_info (from config) to obtain display settings.
-    This content is now used for tooltips.
+    Parameters:
+      properties: the feature's properties
+      dataset_info: a dictionary from config containing display settings for each factor
+      weight_scenario: a dict (e.g., config.weight_scenarios[scenario_name]) specifying the weights
+                       for each factor (keys are like "Adaptability_Index_weight", etc.)
     """
-    # Added border-radius and padding to make rounded corners look better
     html = "<div style='font-family: Verdana; font-size: 12px; border-radius: 8px; padding: 12px;'>"
-    # Use a provided identifier if available.
-    site_id = properties.get('name', properties.get('ID', properties.get('OBJECTID', 'Site')))
-    html += f"<h4>Site: {site_id}</h4>"
     
+    # Header with site identifier.
+    site_id = properties.get('name', properties.get('ID', properties.get('OBJECTID', 'Site')))
+    html += f"<h4 style='margin:0 0 4px 0;'>Site: {site_id}</h4>"
+    
+    # Overall Suitability Index.
     overall = properties.get('Suitability_Index')
     if overall is not None:
         try:
             overall_disp = f"{float(overall):.3f}"
         except Exception:
             overall_disp = overall
-        html += f"<p><strong>Overall Suitability:</strong> {overall_disp}</p>"
+        html += f"<p style='margin:2px 0;'><strong>Overall Suitability:</strong> {overall_disp}</p>"
     
-    html += "<ul style='list-style-type: none; padding: 3;'>"
+    # List all factors for which the weight is nonzero.
+    html += "<ul style='list-style-type: none; padding-left:0; margin:0;'>"
     for factor, info in dataset_info.items():
+        weight_key = f"{factor}_weight"
+        if weight_scenario.get(weight_key, 0) == 0:
+            continue  # Skip factors with zero weight.
         alias = info.get('alias')    # normalized index field
         raw_field = info.get('raw')   # raw value field
-        if alias in properties and raw_field in properties:
-            try:
-                raw_val = float(properties[raw_field])
-                norm_val = float(properties[alias])
-                raw_disp = f"{raw_val:.2f}"
-                norm_disp = f"{norm_val:.3f}"
-            except Exception:
-                raw_disp = properties.get(raw_field, "N/A")
-                norm_disp = properties.get(alias, "N/A")
-            colored_name = (
-                f"<span style='color: {info.get('hex')}; font-weight:bold;'>"
-                f"{info.get('name')}</span>"
-            )
-            html += (
-                f"<li>{colored_name}: {info.get('prefix','')}{raw_disp}{info.get('suffix','')}"
-                f"<br>Index: {norm_disp}/1</li>"
-            )
+        if alias not in properties or raw_field not in properties:
+            continue
+        try:
+            raw_val = float(properties[raw_field])
+            norm_val = float(properties[alias])
+            raw_disp = f"{raw_val:.2f}"
+            norm_disp = f"{norm_val:.3f}"
+        except Exception:
+            raw_disp = properties.get(raw_field, "N/A")
+            norm_disp = properties.get(alias, "N/A")
+        colored_name = (
+            f"<span style='color: {info.get('hex')}; font-weight:bold;'>"
+            f"{info.get('name')}</span>"
+        )
+        html += (
+            f"<li style='margin:2px 0;'>{colored_name}: {info.get('prefix','')}{raw_disp}{info.get('suffix','')}"
+            f"<br><span style='font-size:10px;'>Index: {norm_disp}/1</span></li>"
+        )
     html += "</ul></div>"
     return html
+
 def style_function(feature):
     """
     A basic style function for the GeoJSON layer.
-    (This function is not used when applying a gradient style based on index_norm.)
     """
     return {
          "fillColor": "#228B22",  # forest green
@@ -68,23 +78,6 @@ def style_function(feature):
          "weight": 2,
          "fillOpacity": 0.6
     }
-
-class OnEachFeatureCallback:
-    """
-    (Unused in this version)
-    A callable class that previously bound a popup to each feature.
-    """
-    def __init__(self, dataset_info):
-        self.dataset_info = dataset_info
-
-    def __call__(self, feature, layer):
-        popup_content = create_popup_content(feature['properties'], self.dataset_info)
-        layer.bindPopup(popup_content)
-
-    def __json__(self):
-        # Prevent JSON serialization of this callback.
-        return None
-
 
 def clean_geojson_properties(geojson_data):
     """
@@ -100,14 +93,6 @@ def clean_geojson_properties(geojson_data):
 def interpolate_color(color1, color2, t):
     """
     Linearly interpolate between two hex colors.
-
-    Parameters:
-      - color1: Hex string for the start color (e.g., "#f4fa7d").
-      - color2: Hex string for the end color (e.g., "#16A34A").
-      - t: A value between 0 and 1.
-      
-    Returns:
-      A hex string representing the interpolated color.
     """
     def hex_to_rgb(hex_color):
         hex_color = hex_color.lstrip('#')
@@ -125,20 +110,17 @@ def interpolate_color(color1, color2, t):
 
 def get_style_function(min_val, max_val):
     """
-    Returns a style function that interpolates the fillColor based on the
-    'index_norm' property of each feature.
+    Returns a style function that interpolates fillColor based on the 'index_norm' property.
     """
     def style_function(feature):
         try:
             index_norm = float(feature['properties'].get('index_norm', 0))
         except Exception:
             index_norm = 0
-        # Normalize the index_norm value between 0 and 1.
         if max_val != min_val:
             normalized = (index_norm - min_val) / (max_val - min_val)
         else:
             normalized = 0
-        # Clamp t between 0 and 1.
         normalized = max(0, min(normalized, 1))
         fill_color = interpolate_color("#f4fa7d", "#00732a", normalized)
         return {
@@ -149,67 +131,179 @@ def get_style_function(min_val, max_val):
         }
     return style_function
 
-
 def build_webmap(scenario_geojsons, config, neighborhood_name=None):
     """
-    Build an interactive folium webmap for the Resilience Hub analysis
-    by manually adding GeoJSON features and binding tooltips (instead of popups),
-    along with custom title, logo, legend, and donut chart overlay.
+    Build an interactive folium webmap for the Resilience Hub analysis by adding GeoJSON features
+    with true tooltips, along with custom title, logo, legend, and donut chart overlay.
     
     Parameters:
-      - scenario_geojsons: dict mapping a scenario name (e.g., "ResilienceHub")
-                           to the path of the exported GeoJSON file with computed indices.
+      - scenario_geojsons: dict mapping a scenario name to the path of the exported GeoJSON.
       - config: an instance of ResilienceHubConfig.
-      - neighborhood_name: (optional) if provided, appended to the output filename.
-      
+      - neighborhood_name: (optional) appended to the output filename.
+        
     Returns:
       The file path of the saved HTML map.
     """
-    # For this analysis, assume only one scenario is passed.
+    # Assume only one scenario is passed.
     scenario_name = list(scenario_geojsons.keys())[0]
     print(f"Building Resilience Hub webmap for scenario: {scenario_name}")
+    
+    # Get the current weight scenario from the config.
+    current_weight_scenario = config.weight_scenarios.get(scenario_name, {})
     
     geojson_path = scenario_geojsons[scenario_name]
     gdf = gpd.read_file(geojson_path)
     if gdf.crs is None:
         gdf.set_crs(config.crs, inplace=True)
-    # Reproject to EPSG:4326 for folium.
     gdf = gdf.to_crs("EPSG:4326")
     
-    # Compute global min and max for the index_norm column.
     min_index_norm = gdf["index_norm"].min()
     max_index_norm = gdf["index_norm"].max()
-    
-    # Create a style function that colors features based on index_norm.
     style_func = get_style_function(min_index_norm, max_index_norm)
     
-    # Get the geo_interface and remove any function-valued properties.
     geojson_data = gdf.__geo_interface__
     geojson_data = clean_geojson_properties(geojson_data)
     
-    # Determine map center from the total bounds.
     bounds = gdf.total_bounds  # [minx, miny, maxx, maxy]
     center_lat = (bounds[1] + bounds[3]) / 2
     center_lon = (bounds[0] + bounds[2]) / 2
     
-    # Create the base map.
     m = folium.Map(location=[center_lat, center_lon],
                    zoom_start=12,
                    tiles="CartoDB Positron")
     
-    # Add custom CSS to round the tooltip corners
+    # ---------------------------------------------------------------------
+    # Add meta viewport for mobile responsiveness
+    meta_viewport = '<meta name="viewport" content="width=device-width, initial-scale=1.0">'
+    m.get_root().html.add_child(folium.Element(meta_viewport))
+    
+    # ---------------------------
+    # Add responsive CSS for fixed overlays
+    # The mobile media query now hides the donut chart and top roads lists, and makes the legend smaller.
+    responsive_css = """
+    <style>
+    /* Base styles for overlays */
+    .resilience-title, .analysis-text, .legend-box, .donut-overlay {
+        position: fixed;
+        background-color: white;
+        border: 2px solid grey;
+        border-radius: 15px;
+        box-shadow: 2px 2px 5px rgba(0,0,0,0.3);
+        font-family: Helvetica, sans-serif;
+        z-index: 1000;
+        padding: 10px;
+    }
+    .resilience-title {
+        top: 20px;
+        left: 20px;
+        font-size: 30px;
+        font-weight: bold;
+    }
+    .analysis-text {
+        bottom: 20px;
+        left: 20px;
+        font-size: 30px;
+    }
+    .legend-box {
+        bottom: 20px;
+        right: 20px;
+        padding: 12px;
+        font-size: 12px;
+        width: 200px;
+    }
+    .donut-overlay {
+        top: 100px;
+        left: 20px;
+        font-size: 25px;
+        text-align: center;
+    }
+
+    /* Mobile adjustments: hide donut chart and make legend smaller */
+    @media (max-width: 600px) {
+        .resilience-title {
+            top: 5px;
+            left: 5px;
+            font-size: 18px;
+            padding: 10px;
+            border-width: 1px;
+            border-radius: 10px;
+        }
+        .analysis-text {
+            bottom: 5px;
+            left: 5px;
+            font-size: 12px;
+            padding: 10px;
+            border-width: 1px;
+            border-radius: 10px;
+        }
+        .legend-box {
+            top: 60px;
+            left: 5px;
+            font-size: 9px;
+            padding: 10px;
+            border-width: 1px;
+            border-radius: 10px;
+            width: 150px;
+            height: 270px;
+        }
+        .donut-overlay {
+            display: none !important;
+        }
+    }
+
+    /* Tooltip CSS for donut legend */
+    .tooltip-container {
+        position: relative;
+        display: inline-block;
+    }
+    .tooltip {
+        visibility: hidden;
+        position: absolute;
+        left: 25px;
+        background-color: white;
+        color: #333;
+        padding: 10px;
+        border-radius: 20px;
+        font-size: 8pt;
+        width: 200px;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+        border: 1px solid #ddd;
+        z-index: 1001;
+        opacity: 0;
+        transition: opacity 0.3s;
+    }
+    .tooltip-container:hover .tooltip {
+        visibility: visible;
+        opacity: 1;
+    }
+    .legend-item {
+        position: relative;
+        white-space: nowrap;
+    }
+    .info-icon {
+        color: inherit;
+        font-weight: bold;
+    }
+    </style>
+    """
+    m.get_root().html.add_child(folium.Element(responsive_css))
+
+    
+    # ---------------------------------------------------------------------
+    # Add tooltip custom CSS (kept as in your original code)
     tooltip_custom_css = """
     <style>
     .leaflet-tooltip {
-        border-radius: 20px !important;
+        border-radius: 8px !important;
+        padding: 4px 8px !important;
+        font-size: 12px !important;
     }
     </style>
     """
     m.get_root().html.add_child(folium.Element(tooltip_custom_css))
-
-    # ---------------------------------------
+    
+    # ---------------------------------------------------------------------
     # Add Data Layers
-    # ---------------------------------------
     # Add FOZ layer
     foz_path = os.path.join(config.input_dir, 'FOZ_NYC_Merged.geojson')
     if os.path.exists(foz_path):
@@ -261,139 +355,95 @@ def build_webmap(scenario_geojsons, config, neighborhood_name=None):
                 csc_gdf = csc_gdf.to_crs("EPSG:4326")
             folium.GeoJson(
                 csc_gdf,
-            name="CSC_Neighborhoods",
-            style_function=lambda x: {
-                "color": "gray",
-                "weight": 1,
-                "fillOpacity": 0.07
-            }
-        ).add_to(m)
+                name="CSC_Neighborhoods",
+                style_function=lambda x: {
+                    "color": "gray",
+                    "weight": 1,
+                    "fillOpacity": 0.07
+                }
+            ).add_to(m)
         except Exception as e:
             print(f"Warning: Could not process neighborhoods file: {str(e)}")
-
-    # ---------------------------------------
+    
+    # ---------------------------------------------------------------------
     # Create the feature group for site features with tooltips.
-    # ---------------------------------------
     sites_group = folium.FeatureGroup(name="Sites")
     
-    # Loop over each feature and add it to the map with the new style.
-    sites_group = folium.FeatureGroup(name="Sites")
+    # For each feature, build a tooltip using our function that now considers weight.
     for feature in geojson_data.get('features', []):
-        tooltip_content = create_popup_content(feature['properties'], config.dataset_info)
-        gj_feature = folium.GeoJson(feature, style_function=style_func)
-        # Bind the tooltip instead of a popup.
-        gj_feature.add_child(folium.Tooltip(tooltip_content))
+        tooltip_content = create_tooltip_content(feature['properties'], config.dataset_info, current_weight_scenario)
+        gj_feature = folium.GeoJson(feature, style_function=style_func,
+                                    tooltip=folium.Tooltip(tooltip_content, sticky=True))
         gj_feature.add_to(sites_group)
     sites_group.add_to(m)
     folium.LayerControl().add_to(m)
-
-    # ---------------------------------------
-    # Add title
-    # ---------------------------------------
+    
+    # ---------------------------------------------------------------------
+    # Add Title overlay (using CSS class for responsiveness)
     title_html = f'''
-    <div style="position: fixed; 
-                top: 30px; 
-                left: 30px; 
-                z-index: 1000;
-                background-color: white;
-                padding: 10px;
-                border: 2px solid grey;
-                border-radius: 20px;
-                box-shadow: 2px 2px 5px rgba(0,0,0,0.3);
-                font-size: 30px;
-                font-weight: bold;
-                font-family: Futura Bold, sans-serif;">
-        {list(scenario_geojsons.keys())[0]} Prioritization Tool
+    <div class="resilience-title">
+        Resilience Hub Analysis - {scenario_name} Scenario
     </div>
     '''
     m.get_root().html.add_child(folium.Element(title_html))
     
-    # ---------------------------------------
+    # ---------------------------------------------------------------------
     # Add ONE Analysis logo text box
-    # ---------------------------------------
     analysis_text_html = f'''
-    <div style="
-        position: fixed;
-        bottom: 30px;  
-        left: 30px;
-        z-index: 1000;
-        background-color: white;
-        padding: 10px;
-        border: 2px solid grey;
-        border-radius: 20px;
-        box-shadow: 2px 2px 5px rgba(0,0,0,0.3);
-        font-size: 30px;
-    ">
-        <span style="font-family: Futura Bold, sans-serif; color: #4c5da4;">one</span>
-        <span style="font-family: Futura Light, sans-serif; color: #4c5da4;"> analysis</span>
+    <div class="analysis-text">
+        <span style="font-family: 'Futura', sans-serif; font-weight: bold; color: #4c5da4;">one</span>
+        <span style="font-family: 'Futura', sans-serif; font-weight: 300; color: #4c5da4;"> analysis</span>
     </div>
     '''
     m.get_root().html.add_child(folium.Element(analysis_text_html))
     
-    # ---------------------------------------
-    # Add Legend
-    # ---------------------------------------  
+    # ---------------------------------------------------------------------
+    # Add Legend overlay (wrapped in a responsive container)
     legend_html = """
-    <div style="
-        position: fixed; 
-        bottom: 32px; 
-        right: 32px; 
-        z-index: 9999;
-        background-color: white; 
-        padding: 12px; 
-        border: 2px solid rgb(156 163 175);
-        border-radius: 16px;
-        box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1);
-    ">
-        <h4 style="margin-bottom: 12px; font-size: 20px; font-weight: bold;">Legend</h4>
+    <div class="legend-box">
+        <h4 style="margin-bottom: 5px; font-size: 17px; font-weight: bold;">Legend</h4>
         <div style="display: flex; flex-direction: column; gap: 12px;">
             <!-- Priority Score Section -->
             <div>
-                <h5 style="margin: 4px 0; font-size: 14px; font-weight: 500;">Resilience Hub Priority Score</h5>
+                <h5 style="margin: 5px 0; font-weight: bold;">Resilience Hub Priority Score</h5>
                 <div style="display: flex; flex-direction: column; gap: 4px;">
-                    <!-- Gradient bar -->
                     <div style="
-                        width: 128px; 
-                        height: 8px; 
-                        border-radius: 2px;
+                        width: 120px; 
+                        height: 10px; 
+                        border-radius: 5px;
                         background: linear-gradient(to right, #f4fa7d, #00732a);
                     "></div>
-                    <!-- Score labels -->
-                    <div style="display: flex; justify-content: space-between; width: 128px;">
-                        <span style="font-size: 12px;">0</span>
-                        <span style="font-size: 12px;">1</span>
+                    <div style="display: flex; justify-content: space-between; width: 120px;">
+                        <span style="font-size: 12px;">lower</span>
+                        <span style="font-size: 12px;">higher</span>
                     </div>
                 </div>
             </div>
-
             <!-- Area Overlays Section -->
             <div>
-                <h5 style="margin: 4px 0; font-size: 14px; font-weight: 500;">Area Overlays</h5>
-                <div style="display: flex; flex-direction: column; gap: 4px;">
-                    <div style="display: flex; align-items: center; gap: 8px;">
-                        <div style="width: 20px; height: 20px; background: rgba(128, 128, 128, 0.2); border: 2px solid gray; border-radius: 2px;"></div>
-                        <span style="font-size: 14px;">CSC Neighborhoods</span>
+                <h5 style="margin: 5px 0; font-weight: bold;">Area Overlays</h5>
+                <div style="display: flex; flex-direction: column; gap: 5px;">
+                    <div style="display: flex; align-items: center; gap: 5px;">
+                        <div style="width: 20px; height: 20px; background: rgba(128, 128, 128, 0.2); border: 2px solid gray; border-radius: 3px;"></div>
+                        <span style="font-size: 12px;">CSC Neighborhoods</span>
                     </div>
                     <div style="display: flex; align-items: center; gap: 8px;">
-                        <div style="width: 20px; height: 20px; background: rgba(244, 164, 96, 0.2); border: 1px solid sandybrown; border-radius: 2px;"></div>
-                        <span style="font-size: 14px;">Persistent Poverty Areas</span>
+                        <div style="width: 20px; height: 20px; background: rgba(244, 164, 96, 0.2); border: 1px solid sandybrown; border-radius: 3px;"></div>
+                        <span style="font-size: 12px;">Persistent Poverty Areas</span>
                     </div>
                     <div style="display: flex; align-items: center; gap: 8px;">
-                        <div style="width: 20px; height: 20px; background: rgba(186, 85, 211, 0.2); border: 1px solid MediumOrchid; border-radius: 2px;"></div>
-                        <span style="font-size: 14px;">Federal Opportunity Zones</span>
+                        <div style="width: 20px; height: 20px; background: rgba(186, 85, 211, 0.2); border: 1px solid MediumOrchid; border-radius: 3px;"></div>
+                        <span style="font-size: 12px;">Federal Opportunity Zones</span>
                     </div>
                 </div>
             </div>
         </div>
     </div>
     """
-
-    # Add the legend to the map
     m.get_root().html.add_child(folium.Element(legend_html))
     
-    # ---------------------------------------
+    # ---------------------------------------------------------------------
     # Add Donut Chart Overlay with Interactive Info Icons in Legend
-    # ---------------------------------------    
     # Use the default weight scenario from the config.
     scenario_weights = config.weight_scenarios.get("Default", {})
 
@@ -422,7 +472,6 @@ def build_webmap(scenario_geojsons, config, neighborhood_name=None):
         )
         ax.set_aspect("equal")
         plt.setp(autotexts, size=12, fontfamily='Verdana', weight='bold', color='black', va='center', ha='center')
-        plt.tight_layout()
         
         import io
         svg_buf = io.BytesIO()
@@ -500,18 +549,7 @@ def build_webmap(scenario_geojsons, config, neighborhood_name=None):
         donut_combined = "<svg></svg>"
     
     donut_html = f'''
-    <div style="
-        position: fixed;
-        top: 110px;
-        left: 30px;
-        z-index: 1000;
-        background: white;
-        padding: 10px;
-        border: 2px solid grey;
-        border-radius: 15px;
-        box-shadow: 2px 2px 5px rgba(0,0,0,0.3);
-        font-family: 'Verdana', sans-serif;
-    ">
+    <div class="donut-overlay">
         <h4 style="margin-top: 0; margin-bottom: 0; font-weight: bold; font-size: 25px; text-align: center;">
             Analysis Weights
         </h4>
@@ -520,9 +558,8 @@ def build_webmap(scenario_geojsons, config, neighborhood_name=None):
     '''
     m.get_root().html.add_child(folium.Element(donut_html))
     
-    # ---------------------------------------
+    # ---------------------------------------------------------------------
     # Build output filename and save the map.
-    # ---------------------------------------
     fname = f"{scenario_name}_resilience_hub_webmap"
     if neighborhood_name:
         fname += f"_{neighborhood_name.replace(' ', '_')}"
@@ -530,13 +567,12 @@ def build_webmap(scenario_geojsons, config, neighborhood_name=None):
     
     m.save(html_map_path)
     print(f"Webmap saved to: {html_map_path}")
-    return html_map_path        
+    return html_map_path
 
 # Minimal testing snippet (if running webmap.py directly)
 if __name__ == "__main__":
     from config import ResilienceHubConfig
     config = ResilienceHubConfig()
-    # Assume the exported GeoJSON is saved as "sites_with_indices.geojson" in the output directory.
     exported_geojson = os.path.join(config.output_dir, "sites_with_indices.geojson")
     scenario_geojsons = {"ResilienceHub": exported_geojson}
     build_webmap(scenario_geojsons, config)

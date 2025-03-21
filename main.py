@@ -1,75 +1,70 @@
+# main.py
 import os
 import geopandas as gpd
+from datetime import datetime
 
 def main():
     from config import ResilienceHubConfig
-    from analysis_modules import compute_all_indices_ordered
+    from analysis_modules import compute_all_raw_values, compute_all_indices_from_raw
     import webmap
 
-    # Instantiate the configuration.
+    # Instantiate configuration.
     config = ResilienceHubConfig()
 
-    # Define file paths.
-    indices_file = os.path.join(config.output_dir, "sites_with_indices.geojson")
-    preprocessed_sites_file = os.path.join(config.output_dir, "preprocessed_sites_RH.geojson")
-    
-    # Check if the preprocessed sites file exists; if not, run the preprocessing pipeline.
-    if not os.path.exists(preprocessed_sites_file):
-        print(f"{preprocessed_sites_file} not found. Running full preprocessing pipeline.")
+    # First, ensure that the preprocessed sites exist.
+    preprocessed_file = os.path.join(config.output_dir, "preprocessed_sites_RH.geojson")
+    if not os.path.exists(preprocessed_file):
+        print(f"{preprocessed_file} not found. Running full preprocessing pipeline.")
         from data_preprocessing import full_preprocessing_pipeline
         full_preprocessing_pipeline()
-        # Check again if the file now exists.
-        if not os.path.exists(preprocessed_sites_file):
+        if not os.path.exists(preprocessed_file):
             print("Error: Preprocessing did not produce the expected file. Exiting.")
             return
         else:
             print("Preprocessing complete.")
 
-    # Now check for the indices file.
-    if os.path.exists(indices_file):
-        print("Found precomputed indices file: sites_with_indices.geojson")
-        # Load the GeoDataFrame with precomputed indices.
-        gdf = gpd.read_file(indices_file)
+    # Load the preprocessed sites.
+    gdf = gpd.read_file(preprocessed_file)
 
-        # Recalculate the overall Priority_Index using the precomputed index values.
-        # The calculation uses the precomputed values (using each index's alias)
-        # multiplied by the corresponding weight from the default weight scenario.
-        default_weights = config.weight_scenarios["Default"]
-        priority_series = None
-
-        for index_name, index_info in config.dataset_info.items():
-            weight_key = f"{index_name}_weight"
-            if weight_key in default_weights:
-                alias = index_info["alias"]  # the column name for the computed value
-                if alias in gdf.columns:
-                    if priority_series is None:
-                        priority_series = default_weights[weight_key] * gdf[alias]
-                    else:
-                        priority_series += default_weights[weight_key] * gdf[alias]
-                else:
-                    print(f"Warning: Column '{alias}' not found in the GeoDataFrame.")
-        if priority_series is not None:
-            gdf["Priority_Index"] = priority_series
-        else:
-            print("Warning: No indices found to compute Priority_Index.")
-
-        # Optionally, save the updated GeoDataFrame.
-        gdf.to_file(indices_file, driver="GeoJSON")
-
+    # Now check for a file with the raw values.
+    raw_file = os.path.join(config.output_dir, "raw_values_RH.geojson")
+    if not os.path.exists(raw_file):
+        print(f"Raw values file {raw_file} not found. Computing raw values...")
+        gdf_raw = compute_all_raw_values(gdf, config)
+        gdf_raw.to_file(raw_file, driver="GeoJSON")
+        print("Raw values computed and saved.")
     else:
-        print("sites_with_indices.geojson not found. Running full indices computation pipeline.")
-        # Load the preprocessed sites file.
-        gdf = gpd.read_file(preprocessed_sites_file)
+        print("Using precomputed raw values.")
+        gdf_raw = gpd.read_file(raw_file)
 
-        gdf = compute_all_indices_ordered(gdf, config)
+    # Get current date (YYMMDD) for naming outputs.
+    today_str = datetime.now().strftime("%y%m%d")
 
-        # Save the computed indices to the output file.
-        gdf.to_file(indices_file, driver="GeoJSON")
+    # Loop over each scenario defined in the config.
+    # (Note: your new weight scenarios now include separate weights for coastal and stormwater flood hazards.)
+    for scenario_name, weight_scenario in config.weight_scenarios.items():
+        print(f"\nProcessing scenario: {scenario_name}")
+        # Work on a copy of the raw values dataset.
+        scenario_gdf = gdf_raw.copy()
 
-    # Build the webmap using the (now ensured) indices file.
-    scenario_geojsons = {"ResilienceHub": indices_file}
-    webmap_path = webmap.build_webmap(scenario_geojsons, config)
-    print("Webmap created at:", webmap_path)
+        # Compute indices from the raw values using the scenario's weights.
+        scenario_gdf = compute_all_indices_from_raw(scenario_gdf, config, weight_scenario=weight_scenario)
+        
+        # Save the scenario-specific GeoJSON.
+        geojson_filename = f"{today_str}_RH_{scenario_name}.geojson"
+        geojson_path = os.path.join(config.output_dir, geojson_filename)
+        scenario_gdf.to_file(geojson_path, driver="GeoJSON")
+        print(f"Saved scenario GeoJSON: {geojson_path}")
+
+        # Build the webmap.
+        scenario_geojsons = {scenario_name: geojson_path}
+        webmap_path = webmap.build_webmap(scenario_geojsons, config)
+
+        # Rename the webmap HTML file to include the date and scenario name.
+        new_webmap_filename = f"{today_str}_RH_{scenario_name}.html"
+        new_webmap_path = os.path.join(config.output_dir, new_webmap_filename)
+        os.rename(webmap_path, new_webmap_path)
+        print(f"Saved webmap for scenario {scenario_name}: {new_webmap_path}")
 
 if __name__ == "__main__":
     main()

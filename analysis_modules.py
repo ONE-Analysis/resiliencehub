@@ -554,23 +554,16 @@ import geopandas as gpd
 import numpy as np
 import rasterio
 from rasterio import features
-from rasterio.transform import from_bounds
-from shapely.geometry import box
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor
-import warnings
-import time
+import os
 
-# Flood category definitions (these can also be stored in config if desired)
+# Flood category definitions – Note: 
+# Here, a raster pixel value of 1 means a 500-year flood and 2 means a 100-year flood.
 COAST_VALUES = {1: '500', 2: '100'}
 STORM_VALUES = {1: 'Shl', 2: 'Dp', 3: 'Tid'}
 
 def read_raster_window(raster_path, bbox, target_crs):
-    """
-    Read a window from the raster defined by bbox.
-    Checks that the raster CRS matches target_crs.
-    Returns the array and the transform.
-    """
     with rasterio.open(raster_path) as src:
         if src.crs is not None and src.crs.to_string() != target_crs:
             raise ValueError(f"Raster {raster_path} CRS ({src.crs}) does not match {target_crs}.")
@@ -582,11 +575,9 @@ def read_raster_window(raster_path, bbox, target_crs):
 def process_site_flood(args):
     """
     Process a single site to calculate flood-related fractions.
-    Uses a circular buffer (of radius specified by buffer_dist) around the site's centroid.
     Returns a dictionary with the following keys:
       - Cst_500_in, Cst_500_nr, Cst_100_in, Cst_100_nr,
       - StrmShl_in, StrmShl_nr, StrmDp_in, StrmDp_nr, StrmTid_in, StrmTid_nr.
-    These represent the fraction of the site (or its neighborhood) that meets each flood threshold.
     """
     idx, site, fema_path, storm_path, buffer_dist, target_crs = args
     geom = site.geometry
@@ -600,47 +591,35 @@ def process_site_flood(args):
     minx, miny, maxx, maxy = circle_geom.bounds
     bbox = (minx, miny, maxx, maxy)
     
-    # Read FEMA and Storm raster windows for the area.
     try:
         fema_arr, fema_transform = read_raster_window(fema_path, bbox, target_crs)
-        storm_arr, storm_transform = read_raster_window(storm_path, bbox, target_crs)
+        storm_arr, _ = read_raster_window(storm_path, bbox, target_crs)
     except Exception as e:
-        logger.error(f"Error reading raster windows for site {idx}: {str(e)}")
+        print(f"Error reading raster windows for site {idx}: {str(e)}")
         return idx, {col: 0.0 for col in [
             'Cst_500_in','Cst_500_nr','Cst_100_in','Cst_100_nr',
             'StrmShl_in','StrmShl_nr','StrmDp_in','StrmDp_nr','StrmTid_in','StrmTid_nr'
         ]}
     
-    # Ensure both arrays are the same shape.
+    # Ensure both arrays have the same shape.
     min_height = min(fema_arr.shape[0], storm_arr.shape[0])
     min_width = min(fema_arr.shape[1], storm_arr.shape[1])
     fema_arr = fema_arr[:min_height, :min_width]
     storm_arr = storm_arr[:min_height, :min_width]
     width, height = fema_arr.shape[1], fema_arr.shape[0]
     
-    # Rasterize the site polygon (for "inside" calculations)
-    site_rast = features.rasterize(
-        [(geom, 1)],
-        out_shape=(height, width),
-        transform=fema_transform,
-        fill=0,
-        dtype=np.uint8
-    )
-    # Rasterize the circle (for "neighborhood" calculations)
-    circle_rast = features.rasterize(
-        [(circle_geom, 1)],
-        out_shape=(height, width),
-        transform=fema_transform,
-        fill=0,
-        dtype=np.uint8
-    )
+    # Rasterize the site polygon and its buffer.
+    site_rast = features.rasterize([(geom, 1)], out_shape=(height, width),
+                                    transform=fema_transform, fill=0, dtype=np.uint8)
+    circle_rast = features.rasterize([(circle_geom, 1)], out_shape=(height, width),
+                                      transform=fema_transform, fill=0, dtype=np.uint8)
     site_mask = (site_rast == 1)
     circle_mask = (circle_rast == 1)
     inside_count = site_mask.sum()
     circle_count = circle_mask.sum()
     
     results = {}
-    # For FEMA values ("Coast")
+    # Coast (FEMA) values.
     if inside_count == 0:
         for cval in COAST_VALUES.values():
             results[f"Cst_{cval}_in"] = 0.0
@@ -655,8 +634,8 @@ def process_site_flood(args):
         for cval, ctag in COAST_VALUES.items():
             nr_match = ((circle_mask) & (fema_arr == cval)).sum()
             results[f"Cst_{ctag}_nr"] = nr_match / circle_count
-    
-    # For Storm values
+
+    # Storm values.
     if inside_count == 0:
         for sval in STORM_VALUES.values():
             results[f"Strm{sval}_in"] = 0.0
@@ -676,52 +655,93 @@ def process_site_flood(args):
 
 def compute_raw_flood(gdf, config):
     """
-    Compute the raw flood hazard for each site.
-    Uses FEMA and Storm flood rasters from config (e.g., config.FEMA_RASTER and config.STORM_RASTER),
-    and a buffer distance (from config.analysis_params or default 2000 ft).
-    For each site, processes the flood fractions via multiprocessing and then aggregates
-    the 10 computed fraction fields by taking their mean.
-    The result is stored in the column specified by config.dataset_info["Flood_Hazard_Index"]["raw"].
+    Compute the raw flood hazard for each site by joining the 10 flood component fields.
+    (These fields are fractions between 0 and 1.)
     """
-    # Ensure gdf is in the correct CRS.
     gdf = ensure_crs_vector(gdf, config.crs)
     buffer_dist = config.analysis_params.get("analysis_buffer_ft", 2000)
-    # Get flood raster paths from config (assumed to be added to your config)
-    fema_raster = config.FEMA_RASTER  # e.g., defined in config as a Path
+    fema_raster = config.FEMA_RASTER
     storm_raster = config.STORM_RASTER
-    # Build list of arguments for multiprocessing.
-    args_list = [(idx, row, fema_raster, storm_raster, buffer_dist, config.crs)
-                 for idx, row in gdf.iterrows()]
-    cpu_cnt = mp.cpu_count()
-    with ProcessPoolExecutor(max_workers=config.NUM_WORKERS) as executor:
-        results = list(executor.map(process_site_flood, args_list))    # Convert results (list of (idx, dict)) into a DataFrame
-    results_dict = {}
-    for idx, res in results:
-        results_dict[idx] = res
-    results_df = pd.DataFrame.from_dict(results_dict, orient='index')
-    # Now, aggregate the 10 flood fraction fields into one raw flood risk value.
-    # For example, we take the mean of these 10 fields.
-    fields = [
-        'Cst_500_in','Cst_500_nr','Cst_100_in','Cst_100_nr',
-        'StrmShl_in','StrmShl_nr','StrmDp_in','StrmDp_nr','StrmTid_in','StrmTid_nr'
+
+    args_list = [
+        (idx, row, fema_raster, storm_raster, buffer_dist, config.crs)
+        for idx, row in gdf.iterrows()
     ]
-    results_df["flood_risk"] = results_df[fields].mean(axis=1)
-    # Merge the computed raw flood risk back into gdf (using the same index)
-    gdf = gdf.join(results_df["flood_risk"])
+    cpu_cnt = np.maximum(1, os.cpu_count() - 1)
+    with ProcessPoolExecutor(max_workers=cpu_cnt) as executor:
+        results = list(executor.map(process_site_flood, args_list))
+    results_dict = {idx: res for idx, res in results}
+    # Convert to a DataFrame using pandas (accessible via gdf's pd attribute)
+    results_df = pd.DataFrame.from_dict(results_dict, orient='index')
+
+    flood_components = [
+        'Cst_500_in', 'Cst_500_nr', 'Cst_100_in', 'Cst_100_nr',
+        'StrmShl_in', 'StrmShl_nr', 'StrmDp_in', 'StrmDp_nr', 'StrmTid_in', 'StrmTid_nr'
+    ]
+    gdf = gdf.drop(columns=flood_components, errors='ignore')
+    gdf = gdf.join(results_df[flood_components])
     return gdf
 
-def compute_flood_hazard_index(gdf, config):
+def compute_flood_hazard_indices(gdf, config, coastal_weights=None, stormwater_weights=None):
     """
-    Compute the Flood Hazard Index.
-    First, calculate the raw flood hazard using processing steps from the old flood analysis.
-    Then, because higher flood risk is bad, apply a low-is-good normalization.
+    Compute two flood hazard indices and exclude sites with coastal flooding inside.
+    
+    Exclusion: If any of 'Cst_500_in', 'Cst_100_in', or 'StrmTid_in' are > 0,
+    the site is excluded from the analysis.
+    
+    Coastal Flood Hazard Index is computed from the "nr" values:
+      - Inputs: 'Cst_500_nr', 'Cst_100_nr', 'StrmTid_nr'
+      - Weights (default): 0.15, 0.35, 0.5 respectively
+      - Raw value = weighted average; final index = 1 - raw value
+      
+    Stormwater Flood Hazard Index is computed from:
+      - Inputs: 'StrmShl_nr', 'StrmDp_nr'
+      - Weights (default): 0.3, 0.7 respectively
+      - Raw value = weighted average; final index = 1 - raw value
+      
+    The function returns the GeoDataFrame with two new pairs of fields:
+      "coastal_flood_risk" (raw) and "CoastalFloodHaz" (normalized index),
+      "stormwater_flood_risk" (raw) and "StormFloodHaz" (normalized index).
     """
-    gdf = compute_raw_flood(gdf, config)
-    # In our config, assume the data dictionary for flood hazard is defined as:
-    # "Flood_Hazard_Index": {"alias": "FloodHaz", "raw": "flood_risk", ... }
-    # Because higher flood_risk means higher hazard (worse), we want to use the low-is-good normalization.
-    gdf = compute_index_for_factor_low(gdf, "Flood_Hazard_Index", config)
+    # Ensure raw flood components are present.
+    flood_components = [
+        'Cst_500_in', 'Cst_500_nr', 'Cst_100_in', 'Cst_100_nr',
+        'StrmShl_in', 'StrmShl_nr', 'StrmDp_in', 'StrmDp_nr', 'StrmTid_in', 'StrmTid_nr'
+    ]
+    if not all(comp in gdf.columns for comp in flood_components):
+        gdf = compute_raw_flood(gdf, config)
+    
+    # Exclude sites with any coastal flooding "inside".
+    exclude = (gdf['Cst_500_in'] > 0) | (gdf['Cst_100_in'] > 0) | (gdf['StrmTid_in'] > 0)
+    if exclude.any():
+        gdf = gdf[~exclude].copy()
+    
+    # Coastal Flood Hazard.
+    if coastal_weights is None:
+        coastal_weights = {'Cst_500_nr': 0.15, 'Cst_100_nr': 0.35, 'StrmTid_nr': 0.5}
+    # Compute the weighted average of the coastal "nr" components.
+    coastal_raw = (coastal_weights['Cst_500_nr'] * gdf['Cst_500_nr'] +
+                   coastal_weights['Cst_100_nr'] * gdf['Cst_100_nr'] +
+                   coastal_weights['StrmTid_nr'] * gdf['StrmTid_nr'])
+    # Store the raw value in the field specified by dataset_info "raw" for Coastal Flood Hazard.
+    coastal_raw_field = config.dataset_info["Coastal_Flood_Hazard_Index"]["raw"]  # "coastal_flood_risk"
+    gdf[coastal_raw_field] = coastal_raw
+    # Compute the final index as 1 - raw.
+    coastal_alias = config.dataset_info["Coastal_Flood_Hazard_Index"]["alias"]  # "CoastalFloodHaz"
+    gdf[coastal_alias] = 1 - coastal_raw
+
+    # Stormwater Flood Hazard.
+    if stormwater_weights is None:
+        stormwater_weights = {'StrmShl_nr': 0.3, 'StrmDp_nr': 0.7}
+    storm_raw = (stormwater_weights['StrmShl_nr'] * gdf['StrmShl_nr'] +
+                 stormwater_weights['StrmDp_nr'] * gdf['StrmDp_nr'])
+    storm_raw_field = config.dataset_info["Stormwater_Flood_Hazard_Index"]["raw"]  # "stormwater_flood_risk"
+    gdf[storm_raw_field] = storm_raw
+    storm_alias = config.dataset_info["Stormwater_Flood_Hazard_Index"]["alias"]  # "StormFloodHaz"
+    gdf[storm_alias] = 1 - storm_raw
+
     return gdf
+
 
 ###############################################################################
 # VULNERABILITY ANALYSIS – Raw Value Computation Integration
@@ -998,32 +1018,32 @@ def compute_service_population_index(gdf, config):
     gdf = compute_raw_population(gdf, config)
     return compute_index_for_factor_high(gdf, "Service_Population_Index", config)
 
+###############################################################################
+# FINAL INDEX CALCULATIONS (Adapted for Separate Flood Indices)
+###############################################################################
+
 def compute_all_indices(gdf, config, weight_scenario=None):
     """
     Compute all individual indices and then an overall Suitability_Index.
     
-    For each factor defined in config.dataset_info, this function:
-      - Uses the mapping 'index_directions' to determine whether a high raw value is good ("high")
-        or bad ("low").
-      - Calls either compute_index_for_factor_high() or compute_index_for_factor_low() accordingly.
-      
-    Finally, the overall index is computed as a weighted sum using the weights from the chosen
-    weight scenario, and a normalized index ('index_norm') is added.
+    For each factor defined in config.dataset_info (except the old Flood_Hazard_Index),
+    this function applies the appropriate normalization (high-is-good or low-is-good).
+    Finally, the overall index is computed as a weighted sum using the weights from the
+    chosen weight scenario, and then the two new flood indices (CoastalFloodHaz and StormFloodHaz)
+    are added with fixed weights (0.05 each). A normalized overall index ('index_norm') is then added.
     """
-    # Mapping: for each factor, indicate if a higher raw value is "good" or "bad".
+    # Mapping: for each factor (excluding flood), indicate if a higher raw value is "good" or "bad".
     index_directions = {
          "Adaptability_Index": "high",
          "Solar_Energy_Index": "high",
          "Heat_Hazard_Index": "low",
-         "Flood_Hazard_Index": "low",
          "Heat_Vulnerability_Index": "low",
          "Flood_Vulnerability_Index": "low",
          "Service_Population_Index": "high"
     }
     
-    # Loop over each factor from the data dictionary in the config.
+    # Process each factor except the old flood factor.
     for factor in config.dataset_info.keys():
-        # Skip any factors not specified in the mapping.
         if factor not in index_directions:
             continue
         if index_directions[factor] == "high":
@@ -1035,66 +1055,179 @@ def compute_all_indices(gdf, config, weight_scenario=None):
     if weight_scenario is None:
         weight_scenario = list(config.weight_scenarios.values())[0]
     
-    # Compute the overall Suitability Index as a weighted sum.
+    # Compute the overall Suitability Index for factors other than flood.
     overall = 0.0
     for factor, info in config.dataset_info.items():
+        # Skip the old flood factor.
+        if factor == "Flood_Hazard_Index":
+            continue
         weight_key = f"{factor}_weight"
         overall += gdf[info["alias"]] * weight_scenario.get(weight_key, 0)
+    
+    # Now add the two new flood factors with fixed weights.
+    overall += gdf["CoastalFloodHaz"] * 0.05 + gdf["StormFloodHaz"] * 0.05
     
     gdf["Suitability_Index"] = overall
     gdf["index_norm"] = min_max_normalize(gdf["Suitability_Index"])
     return gdf
 
 
-def compute_all_indices_ordered(gdf, config):
+def compute_all_raw_values(gdf, config):
     """
-    Compute each analysis (Adaptability, Solar, Heat, Flood, Vulnerability, and Service Population)
-    in the order defined. After each factor is processed, print summary statistics for both the
-    raw value and the normalized index.
+    Compute all raw values for the analysis and add them as columns on gdf.
+    This function calls the raw value routines for each factor.
+    """
+    # For Adaptability
+    try:
+        gdf = compute_raw_adaptability(gdf, config)
+    except Exception as e:
+        print("Error computing raw adaptability:", e)
+    # For Solar
+    try:
+        gdf = compute_raw_solar(gdf, config)
+    except Exception as e:
+        print("Error computing raw solar potential:", e)
+    # For Heat Hazard
+    try:
+        gdf = compute_raw_heat(gdf, config)
+    except Exception as e:
+        print("Error computing raw heat:", e)
+    # For Flood – raw computation returns the 10 component fields
+    try:
+        gdf = compute_raw_flood(gdf, config)
+    except Exception as e:
+        print("Error computing raw flood values:", e)
+    # For Heat Vulnerability
+    try:
+        gdf = compute_raw_heat_vulnerability(gdf, config)
+    except Exception as e:
+        print("Error computing raw heat vulnerability:", e)
+    # For Flood Vulnerability
+    try:
+        gdf = compute_raw_flood_vulnerability(gdf, config)
+    except Exception as e:
+        print("Error computing raw flood vulnerability:", e)
+    # For Service Population
+    try:
+        gdf = compute_raw_population(gdf, config)
+    except Exception as e:
+        print("Error computing raw population:", e)
+    return gdf
+
+
+def compute_all_indices_from_raw(gdf, config, weight_scenario=None):
+    """
+    Assuming gdf already has raw values computed for each factor, this function
+    applies normalization to create index columns and computes the overall Suitability_Index.
+    
+    For the flood factor, instead of a single Flood_Hazard_Index, it uses the two new indices:
+    CoastalFloodHaz and StormFloodHaz.
+    In the overall weighting, each is weighted at 0.05.
+    """
+    from analysis_modules import compute_index_for_factor_high, compute_index_for_factor_low, compute_all_indices
+
+    # For Adaptability – high-is-good
+    if config.dataset_info["Adaptability_Index"]["raw"] in gdf.columns:
+        gdf = compute_index_for_factor_high(gdf, "Adaptability_Index", config)
+    else:
+        gdf = compute_adaptability_index(gdf, config)
+    
+    # For Solar – high-is-good
+    if config.dataset_info["Solar_Energy_Index"]["raw"] in gdf.columns:
+        gdf = compute_index_for_factor_high(gdf, "Solar_Energy_Index", config)
+    else:
+        gdf = compute_solar_energy_index(gdf, config)
+    
+    # For Heat Hazard – low-is-good
+    if config.dataset_info["Heat_Hazard_Index"]["raw"] in gdf.columns:
+        gdf = compute_index_for_factor_low(gdf, "Heat_Hazard_Index", config)
+    else:
+        gdf = compute_heat_index(gdf, config)
+    
+    # For Flood, use the new separate indices.
+    gdf = compute_flood_hazard_indices(gdf, config)
+    
+    # For Heat Vulnerability – low-is-good
+    if config.dataset_info["Heat_Vulnerability_Index"]["raw"] in gdf.columns:
+        gdf = compute_index_for_factor_high(gdf, "Heat_Vulnerability_Index", config)
+    else:
+        gdf = compute_heat_vulnerability_index(gdf, config)
+    
+    # For Flood Vulnerability – low-is-good
+    if config.dataset_info["Flood_Vulnerability_Index"]["raw"] in gdf.columns:
+        gdf = compute_index_for_factor_high(gdf, "Flood_Vulnerability_Index", config)
+    else:
+        gdf = compute_flood_vulnerability_index(gdf, config)
+    
+    # For Service Population – high-is-good
+    if config.dataset_info["Service_Population_Index"]["raw"] in gdf.columns:
+        gdf = compute_index_for_factor_high(gdf, "Service_Population_Index", config)
+    else:
+        gdf = compute_service_population_index(gdf, config)
+    
+    # Compute the overall Suitability Index.
+    if weight_scenario is None:
+        weight_scenario = list(config.weight_scenarios.values())[0]
+    
+    overall = 0.0
+    for factor, info in config.dataset_info.items():
+        if factor == "Flood_Hazard_Index":
+            continue  # skip the old flood factor
+        weight_key = f"{factor}_weight"
+        overall += gdf[info["alias"]] * weight_scenario.get(weight_key, 0)
+    
+    overall += gdf["CoastalFloodHaz"] * 0.05 + gdf["StormFloodHaz"] * 0.05
+    
+    gdf["Suitability_Index"] = overall
+    gdf["index_norm"] = min_max_normalize(gdf["Suitability_Index"])
+    return gdf
+
+
+def compute_all_indices_ordered(gdf, config, weight_scenario=None):
+    """
+    Compute each analysis in order and then an overall Suitability Index,
+    using the provided weight_scenario (if given) for the overall index calculation.
     """
     # 1. Adaptability Analysis
     print("\n--- Running Adaptability Analysis ---")
     gdf = compute_adaptability_index(gdf, config)
-    raw_field = config.dataset_info["Adaptability_Index"]["raw"]      # e.g., "bldg_adapt"
-    idx_field = config.dataset_info["Adaptability_Index"]["alias"]      # e.g., "Adaptability"
+    raw_field = config.dataset_info["Adaptability_Index"]["raw"]
+    idx_field = config.dataset_info["Adaptability_Index"]["alias"]
     print(f"Adaptability raw values ({raw_field}):\n", gdf[raw_field].describe())
     print(f"Adaptability index ({idx_field}):\n", gdf[idx_field].describe())
 
     # 2. Solar Analysis
     print("\n--- Running Solar Energy Analysis ---")
     gdf = compute_solar_energy_index(gdf, config)
-    raw_field = config.dataset_info["Solar_Energy_Index"]["raw"]        # e.g., "solar_pot"
-    idx_field = config.dataset_info["Solar_Energy_Index"]["alias"]        # e.g., "Solar"
+    raw_field = config.dataset_info["Solar_Energy_Index"]["raw"]
+    idx_field = config.dataset_info["Solar_Energy_Index"]["alias"]
     print(f"Solar raw values ({raw_field}):\n", gdf[raw_field].describe())
     print(f"Solar index ({idx_field}):\n", gdf[idx_field].describe())
 
     # 3. Heat Analysis
     print("\n--- Running Heat Hazard Analysis ---")
     gdf = compute_heat_index(gdf, config)
-    raw_field = config.dataset_info["Heat_Hazard_Index"]["raw"]           # e.g., "heat_mean"
-    idx_field = config.dataset_info["Heat_Hazard_Index"]["alias"]           # e.g., "HeatHaz"
+    raw_field = config.dataset_info["Heat_Hazard_Index"]["raw"]
+    idx_field = config.dataset_info["Heat_Hazard_Index"]["alias"]
     print(f"Heat raw values ({raw_field}):\n", gdf[raw_field].describe())
     print(f"Heat index ({idx_field}):\n", gdf[idx_field].describe())
 
     # 4. Flood Analysis
     print("\n--- Running Flood Hazard Analysis ---")
-    gdf = compute_flood_hazard_index(gdf, config)
-    raw_field = config.dataset_info["Flood_Hazard_Index"]["raw"]          # e.g., "flood_risk"
-    idx_field = config.dataset_info["Flood_Hazard_Index"]["alias"]          # e.g., "FloodHaz"
-    print(f"Flood raw values ({raw_field}):\n", gdf[raw_field].describe())
-    print(f"Flood index ({idx_field}):\n", gdf[idx_field].describe())
+    gdf = compute_flood_hazard_indices(gdf, config)
+    # Here we print the new separate flood indices.
+    print("Coastal Flood Hazard (CoastalFloodHaz):\n", gdf["CoastalFloodHaz"].describe())
+    print("Stormwater Flood Hazard (StormFloodHaz):\n", gdf["StormFloodHaz"].describe())
 
-    # 5. Vulnerability Analysis
-    #    (Heat Vulnerability)
+    # 5. Vulnerability Analysis – Heat
     print("\n--- Running Heat Vulnerability Analysis ---")
     gdf = compute_heat_vulnerability_index(gdf, config)
-    # For heat vulnerability, the raw field may have been computed earlier (e.g. in 'hvi_area')
     raw_field = config.dataset_info["Heat_Vulnerability_Index"].get("raw", "hvi_area")
     idx_field = config.dataset_info["Heat_Vulnerability_Index"]["alias"]
     print(f"Heat Vulnerability raw values ({raw_field}):\n", gdf[raw_field].describe())
     print(f"Heat Vulnerability index ({idx_field}):\n", gdf[idx_field].describe())
 
-    #    (Flood Vulnerability)
+    # 6. Vulnerability Analysis – Flood
     print("\n--- Running Flood Vulnerability Analysis ---")
     gdf = compute_flood_vulnerability_index(gdf, config)
     raw_field = config.dataset_info["Flood_Vulnerability_Index"].get("raw", "flood_vuln")
@@ -1102,7 +1235,7 @@ def compute_all_indices_ordered(gdf, config):
     print(f"Flood Vulnerability raw values ({raw_field}):\n", gdf[raw_field].describe())
     print(f"Flood Vulnerability index ({idx_field}):\n", gdf[idx_field].describe())
 
-    # 6. Census / Service Population Analysis
+    # 7. Service Population Analysis
     print("\n--- Running Service Population Analysis ---")
     gdf = compute_service_population_index(gdf, config)
     raw_field = config.dataset_info["Service_Population_Index"]["raw"]
@@ -1110,10 +1243,9 @@ def compute_all_indices_ordered(gdf, config):
     print(f"Service Population raw values ({raw_field}):\n", gdf[raw_field].describe())
     print(f"Service Population index ({idx_field}):\n", gdf[idx_field].describe())
 
-    # Finally, compute an overall Suitability Index as a weighted sum.
+    # Finally, compute the overall Suitability Index.
     print("\n--- Computing Overall Suitability Index ---")
-    gdf = compute_all_indices(gdf, config)
+    gdf = compute_all_indices(gdf, config, weight_scenario=weight_scenario)
     print("Overall Suitability Index:\n", gdf["Suitability_Index"].describe())
     print("Normalized Overall Suitability Index:\n", gdf["index_norm"].describe())
-
     return gdf

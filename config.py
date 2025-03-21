@@ -55,7 +55,7 @@ class ResilienceHubConfig:
         # ]
 
         self.priority2_types = []
-        
+
         self.facilities_required_columns = [
             'geometry', 'fclass', 'name', 'FACTYPE', 'FACSUBGRP', 'FACGROUP',
             'FACDOMAIN', 'OPNAME', 'OPABBREV', 'OPTYPE', 'CAPACITY', 'RH_Priority'
@@ -84,6 +84,7 @@ class ResilienceHubConfig:
             self.analysis_params.update(citywide_specific)
         elif analysis_type.lower() == 'neighborhood':
             self.analysis_params.update(neighborhood_specific)
+        analysis_buffer_ft = self.analysis_params.get("analysis_buffer_ft")
 
         # Weight scenarios for the indices
         self.weight_scenarios = {
@@ -91,7 +92,8 @@ class ResilienceHubConfig:
                 'Adaptability_Index_weight': 0.10,
                 'Solar_Energy_Index_weight': 0.15,
                 'Heat_Hazard_Index_weight': 0.05,
-                'Flood_Hazard_Index_weight': 0.10,
+                'Coastal_Flood_Hazard_Index_weight': 0.05,
+                'Stormwater_Flood_Hazard_Index_weight': 0.05,
                 'Heat_Vulnerability_Index_weight': 0.20,
                 'Flood_Vulnerability_Index_weight': 0.15,
                 'Service_Population_Index_weight': 0.25,
@@ -103,27 +105,25 @@ class ResilienceHubConfig:
                 },
                 'Solar_Energy_Index_components': {'peak_power': 1.0},
                 'Heat_Hazard_Index_components': {'heat_mean': 1.0},
-                'Flood_Hazard_Index_components': {
-                    'Cst_500_in': 0.05,
-                    'Cst_500_nr': 0.05,
-                    'Cst_100_in': 0.15,
-                    'Cst_100_nr': 0.15,
-                    'StrmShl_in': 0.05,
-                    'StrmShl_nr': 0.05,
-                    'StrmDp_in': 0.10,
-                    'StrmDp_nr': 0.10,
-                    'StrmTid_in': 0.15,
-                    'StrmTid_nr': 0.15
+                'Coastal_Flood_Hazard_Index_components': {
+                    'Cst_500_nr': 0.15,
+                    'Cst_100_nr': 0.35,
+                    'StrmTid_nr': 0.50
+                },
+                'Stormwater_Flood_Hazard_Index_components': {
+                    'StrmShl_nr': 0.30,
+                    'StrmDp_nr': 0.70
                 },
                 'Heat_Vulnerability_Index_components': {'hvi_area': 1.0},
                 'Flood_Vulnerability_Index_components': {'ssvul_area': 0.50, 'tivul_area': 0.50},
                 'Service_Population_Index_components': {'pop_est': 1.0}
             },
-            'AggressiveSolar': {
+            'Aggressive Solar': {
                 'Adaptability_Index_weight': 0.08,
                 'Solar_Energy_Index_weight': 0.30,
                 'Heat_Hazard_Index_weight': 0.04,
-                'Flood_Hazard_Index_weight': 0.08,
+                'Coastal_Flood_Hazard_Index_weight': 0.05,
+                'Stormwater_Flood_Hazard_Index_weight': 0.05,
                 'Heat_Vulnerability_Index_weight': 0.18,
                 'Flood_Vulnerability_Index_weight': 0.10,
                 'Service_Population_Index_weight': 0.22,
@@ -135,17 +135,14 @@ class ResilienceHubConfig:
                 },
                 'Solar_Energy_Index_components': {'peak_power': 1.0},
                 'Heat_Hazard_Index_components': {'heat_mean': 1.0},
-                'Flood_Hazard_Index_components': {
-                    'Cst_500_in': 0.04,
-                    'Cst_500_nr': 0.04,
-                    'Cst_100_in': 0.12,
-                    'Cst_100_nr': 0.12,
-                    'StrmShl_in': 0.04,
-                    'StrmShl_nr': 0.04,
-                    'StrmDp_in': 0.08,
-                    'StrmDp_nr': 0.08,
-                    'StrmTid_in': 0.16,
-                    'StrmTid_nr': 0.16
+                'Coastal_Flood_Hazard_Index_components': {
+                    'Cst_500_nr': 0.15,
+                    'Cst_100_nr': 0.35,
+                    'StrmTid_nr': 0.50
+                },
+                'Stormwater_Flood_Hazard_Index_components': {
+                    'StrmShl_nr': 0.30,
+                    'StrmDp_nr': 0.70
                 },
                 'Heat_Vulnerability_Index_components': {'hvi_area': 1.0},
                 'Flood_Vulnerability_Index_components': {'ssvul_area': 0.55, 'tivul_area': 0.45},
@@ -157,7 +154,8 @@ class ResilienceHubConfig:
             "Adaptability_Index_components": self.weight_scenarios['Default']['Adaptability_Index_components'],
             "Solar_Energy_Index_components": self.weight_scenarios['Default']['Solar_Energy_Index_components'],
             "Heat_Hazard_Index_components": self.weight_scenarios['Default']['Heat_Hazard_Index_components'],
-            "Flood_Hazard_Index_components": self.weight_scenarios['Default']['Flood_Hazard_Index_components'],
+            "Coastal_Flood_Hazard_Index_components": self.weight_scenarios['Default']['Coastal_Flood_Hazard_Index_components'],
+            "Stormwater_Flood_Hazard_Index_components": self.weight_scenarios['Default']['Stormwater_Flood_Hazard_Index_components'],
             "Heat_Vulnerability_Index_components": self.weight_scenarios['Default']['Heat_Vulnerability_Index_components'],
             "Flood_Vulnerability_Index_components": self.weight_scenarios['Default']['Flood_Vulnerability_Index_components'],
             "Service_Population_Index_components": self.weight_scenarios['Default']['Service_Population_Index_components']
@@ -191,7 +189,7 @@ class ResilienceHubConfig:
                 "alias": "Adaptability",
                 "raw": "bldg_adapt",
                 "name": "Building Adaptability",
-                "description": "Evaluates building characteristics that support adaptive reuse.",
+                "description": "Prioritizes building characteristics that indicate greater capacity for adaptive reuse. <br>Source:<br>PLUTO Zoning Map and National Structures Inventory Data.",
                 "prefix": "",
                 "suffix": "",
                 "hex": "#99789D"
@@ -200,7 +198,7 @@ class ResilienceHubConfig:
                 "alias": "SolarEnergy",
                 "raw": "solar_pot",
                 "name": "Solar Energy Potential",
-                "description": "Estimates potential for solar power generation.",
+                "description": "Prioritizes buildings with higher solar power generation potential. <br>Source:<br>Generated through combining building footprint and height data with typical solar radiation values for NYC's location. Analysis accounts for shadows from nearby buildings and assumes solar panels can cover 70% of each roof with 20% panel efficiency, using historical average monthly solar radiation values.",
                 "prefix": "~",
                 "suffix": " kW",
                 "hex": "#E2C85D"
@@ -209,16 +207,25 @@ class ResilienceHubConfig:
                 "alias": "HeatHaz",
                 "raw": "heat_mean",
                 "name": "Heat Hazard",
-                "description": "Measures heat based on average summer temperatures.",
+                "description": f"Prioritizes buildings in areas with higher summer temperatures, based on a buffer of {analysis_buffer_ft} feet. <br>Source:<br>Daytime summer temperatures 2020-2023, Landsat Infrared Cloudless Composite via Google Earth Engine",
                 "prefix": "",
                 "suffix": " °F",
                 "hex": "#C26558"
             },
-            "Flood_Hazard_Index": {
-                "alias": "FloodHaz",
-                "raw": "flood_risk",
-                "name": "Flood Hazard",
-                "description": "Assesses flood risk using historical flood data and proximity.",
+            "Coastal_Flood_Hazard_Index": {
+                "alias": "CoastalFloodHaz",
+                "raw": "coastal_flood_risk",
+                "name": "Coastal Flood Hazard",
+                "description": f"Prioritizes buildings with higher amounts of coastal flooding within {analysis_buffer_ft} feet. Sites with any direct overlap with coastal flooding are excluded. <br>Source:<br>500-year and 100-year Flood Maps, FEMA.",
+                "prefix": "",
+                "suffix": "",
+                "hex": "#79CFD8"
+            },
+            "Stormwater_Flood_Hazard_Index": {
+                "alias": "StormFloodHaz",
+                "raw": "stormwater_flood_risk",
+                "name": "Stormwater Flood Hazard",
+                "description": f"Prioritizes buildings with higher amounts of stormwater flooding within {analysis_buffer_ft} feet. <br>Source:<br>Stormwater Flood Maps, NYC DEP.",
                 "prefix": "",
                 "suffix": "",
                 "hex": "#6988B0"
@@ -227,7 +234,7 @@ class ResilienceHubConfig:
                 "alias": "HeatVuln",
                 "raw": "hvi_area",
                 "name": "Heat Vulnerability",
-                "description": "Quantifies social vulnerability to heat hazards.",
+                "description": f"Prioritizes buildings in areas of higher social vulnerability to heat hazards, based on a buffer of {analysis_buffer_ft} feet. <br>Source:<br>Heat Vulnerability Index, NYC DOHMH",
                 "prefix": "",
                 "suffix": "",
                 "hex": "#C77851"
@@ -236,16 +243,16 @@ class ResilienceHubConfig:
                 "alias": "FloodVuln",
                 "raw": "flood_vuln",
                 "name": "Flood Vulnerability",
-                "description": "Quantifies social vulnerability to flood hazards.",
+                "description": f"Prioritizes buildings in areas of higher social vulnerability to flood hazards, based on a buffer of {analysis_buffer_ft} feet. <br>Source:<br>Coastal and Storm Surge Flood Vulnerability Indices, NYC MOCEJ.",
                 "prefix": "",
                 "suffix": "",
-                "hex": "#6BADC9"
+                "hex": "#6168C1"
             },
             "Service_Population_Index": {
                 "alias": "ServicePop",
                 "raw": "pop_est",
                 "name": "Service Population",
-                "description": "Estimates the number of people served within a defined area.",
+                "description": f"Prioritizes buildings with more people living within {analysis_buffer_ft} feet. <br>Source:<br>US Census, 2020",
                 "prefix": "~",
                 "suffix": " people",
                 "hex": "#777C77"
